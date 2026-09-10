@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+
+import argparse
+import re
+from collections import deque
+from pathlib import Path
+from urllib.parse import urljoin, urlparse, urlunparse
+
+import requests
+from bs4 import BeautifulSoup
+
+
+URL_ATTRS = ["href"]
+
+CSRF_TOKEN_PATTERNS = [
+    r"csrf",
+    r"xsrf",
+    r"_token",
+    r"authenticity_token",
+    r"requestverificationtoken",
+    r"anti[-_]?forgery",
+    r"nonce",
+]
+
+STATE_CHANGING_WORDS = [
+    "delete",
+    "remove",
+    "destroy",
+    "update",
+    "edit",
+    "change",
+    "create",
+    "add",
+    "save",
+    "submit",
+    "password",
+    "email",
+    "profile",
+    "account",
+    "transfer",
+    "payment",
+    "checkout",
+    "order",
+    "logout",
+]
+
+
+class CSRFScanner:
+    def __init__(self, base_url, max_pages=50, timeout=10):
+        self.base_url = self.normalize_url(base_url)
+        self.origin = self.get_origin(self.base_url)
+
+        self.max_pages = max_pages
+        self.timeout = timeout
+
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Authorized-CSRF-Candidate-Scanner/1.0"
+        })
+
+        self.visited = set()
+        self.findings = []
+
+    @staticmethod
+    def normalize_url(url):
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+
+        return url
+
+    @staticmethod
+    def get_origin(url):
+        parsed = urlparse(url)
+
+        return (
+            f"{parsed.scheme}://"
+            f"{parsed.netloc}"
+        )
+
+    def same_origin(self, url):
+        return self.get_origin(url) == self.origin
+
+    def add_finding(self, kind, url, evidence):
+        finding = {
+            "type": kind,
+            "url": url,
+            "evidence": evidence.strip(),
+        }
+
+        if finding not in self.findings:
+            self.findings.append(finding)
+
+    def request(self, url):
+        try:
+            response = self.session.get(
+                url,
+                timeout=self.timeout,
+                allow_redirects=True,
+            )
+
+            return response
+
+        except requests.RequestException as exc:
+            print(
+                f"[!] Request failed: "
+                f"{url}: {exc}"
+            )
+
+            return None
+
+    def looks_like_csrf_token(self, name):
+        if not name:
+            return False
+
+        for pattern in CSRF_TOKEN_PATTERNS:
+            if re.search(pattern, name, re.I):
+                return True
+
+        return False
+
+    def has_csrf_token(self, form):
+        for field in form.find_all(
+            ["input", "textarea"]
+        ):
+            name = field.get("name", "")
+
+            if self.looks_like_csrf_token(name):
+                return True
+
+        return False
+
+    def get_form_fields(self, form):
+        fields = []
+
+        for field in form.find_all(
+            ["input", "textarea", "select", "button"]
+        ):
+            name = field.get("name")
+
+            if name:
+                fields.append(name)
+
+        return fields
+
+    def looks_state_changing(self, action, fields):
+        text = (
+            action
+            + " "
+            + " ".join(fields)
+        ).lower()
+
+        return any(
+            word in text
+            for word in STATE_CHANGING_WORDS
+        )
+
+    def inspect_forms(self, soup, page_url):
+        for form in soup.find_all("form"):
+            action = urljoin(
+                page_url,
+                form.get("action") or page_url,
+            )
+
+            method = (
+                form.get("method")
+                or "GET"
+            ).upper()
+
+            fields = self.get_form_fields(form)
+            csrf_token = self.has_csrf_token(form)
+
+            field_text = (
+                ", ".join(fields)
+                if fields
+                else "(none)"
+            )
+
+            if method == "POST":
+                if not csrf_token:
+                    self.add_finding(
+                        "CSRF candidate",
+                        action,
+                        (
+                            "POST form without an obvious "
+                            "CSRF token. Fields: "
+                            + field_text
+                        ),
+                    )
+
+                else:
+                    self.add_finding(
+                        "CSRF protected form candidate",
+                        action,
+                        (
+                            "POST form contains a field "
+                            "that looks like a CSRF token. "
+                            "Fields: "
+                            + field_text
+                        ),
+                    )
+
+            elif method == "GET":
+                if self.looks_state_changing(
+                    action,
+                    fields,
+                ):
+                    self.add_finding(
+                        "State-changing GET candidate",
+                        action,
+                        (
+                            "GET form appears potentially "
+                            "state-changing. Fields: "
+                            + field_text
+                        ),
+                    )
+
+    def inspect_cookies(self, response, page_url):
+        raw_cookies = response.headers.get(
+            "Set-Cookie",
+            "",
+        )
+
+        if not raw_cookies:
+            return
+
+        lower = raw_cookies.lower()
+
+        if "samesite=" not in lower:
+            self.add_finding(
+                "Cookie CSRF hardening candidate",
+                page_url,
+                (
+                    "Set-Cookie header observed without "
+                    "an obvious SameSite attribute"
+                ),
+            )
+
+        if (
+            "samesite=none" in lower
+            and "secure" not in lower
+        ):
+            self.add_finding(
+                "Cookie configuration candidate",
+                page_url,
+                (
+                    "Cookie appears to use "
+                    "SameSite=None without Secure"
+                ),
+            )
+
+    def inspect_meta_tokens(self, soup, page_url):
+        for meta in soup.find_all("meta"):
+            name = meta.get("name", "")
+
+            if self.looks_like_csrf_token(name):
+                self.add_finding(
+                    "CSRF token metadata",
+                    page_url,
+                    (
+                        "Page contains CSRF-related "
+                        f"meta field: {name}"
+                    ),
+                )
+
+    def extract_links(self, soup, page_url):
+        links = set()
+
+        for tag in soup.find_all(True):
+            for attr in URL_ATTRS:
+                value = tag.get(attr)
+
+                if not value:
+                    continue
+
+                link = urljoin(
+                    page_url,
+                    value,
+                )
+
+                parsed = urlparse(link)
+
+                if parsed.scheme not in {
+                    "http",
+                    "https",
+                }:
+                    continue
+
+                link = urlunparse((
+                    parsed.scheme,
+                    parsed.netloc,
+                    parsed.path,
+                    parsed.params,
+                    parsed.query,
+                    "",
+                ))
+
+                if self.same_origin(link):
+                    links.add(link)
+
+        return links
+
+    def scan_page(self, url):
+        print(f"[*] Scanning {url}")
+
+        response = self.request(url)
+
+        if response is None:
+            return set()
+
+        content_type = response.headers.get(
+            "Content-Type",
+            "",
+        )
+
+        if "text/html" not in content_type.lower():
+            return set()
+
+        final_url = response.url
+
+        if not self.same_origin(final_url):
+            return set()
+
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser",
+        )
+
+        self.inspect_forms(
+            soup,
+            final_url,
+        )
+
+        self.inspect_cookies(
+            response,
+            final_url,
+        )
+
+        self.inspect_meta_tokens(
+            soup,
+            final_url,
+        )
+
+        return self.extract_links(
+            soup,
+            final_url,
+        )
+
+    def crawl(self):
+        queue = deque([
+            self.base_url
+        ])
+
+        while (
+            queue
+            and len(self.visited)
+            < self.max_pages
+        ):
+            url = queue.popleft()
+
+            if url in self.visited:
+                continue
+
+            self.visited.add(url)
+
+            links = self.scan_page(url)
+
+            for link in links:
+                if link not in self.visited:
+                    queue.append(link)
+
+    def save_report(self, filename):
+        output = Path(filename)
+
+        with output.open(
+            "w",
+            encoding="utf-8",
+        ) as file:
+            file.write(
+                "CSRF CANDIDATE REPORT\n"
+            )
+
+            file.write(
+                "=" * 80 + "\n\n"
+            )
+
+            file.write(
+                f"Pages scanned: "
+                f"{len(self.visited)}\n"
+            )
+
+            file.write(
+                f"Candidates: "
+                f"{len(self.findings)}\n\n"
+            )
+
+            for number, finding in enumerate(
+                self.findings,
+                1,
+            ):
+                file.write(
+                    f"[{number}] "
+                    f"{finding['type']}\n"
+                )
+
+                file.write(
+                    f"URL: "
+                    f"{finding['url']}\n"
+                )
+
+                file.write(
+                    f"Evidence: "
+                    f"{finding['evidence']}\n"
+                )
+
+                file.write(
+                    "-" * 80 + "\n"
+                )
+
+        print(
+            f"\n[+] Report written to "
+            f"{output}"
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Authorized passive "
+            "CSRF candidate scanner"
+        )
+    )
+
+    parser.add_argument(
+        "url",
+        help="Base URL to scan",
+    )
+
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=50,
+        help=(
+            "Maximum number of pages "
+            "to crawl"
+        ),
+    )
+
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=10,
+        help=(
+            "HTTP request timeout "
+            "in seconds"
+        ),
+    )
+
+    parser.add_argument(
+        "--output",
+        default="csrf_report.txt",
+        help="Output report filename",
+    )
+
+    args = parser.parse_args()
+
+    scanner = CSRFScanner(
+        args.url,
+        max_pages=args.max_pages,
+        timeout=args.timeout,
+    )
+
+    scanner.crawl()
+
+    scanner.save_report(
+        args.output
+    )
+
+
+if __name__ == "__main__":
+    main()
